@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from simulation.rov_simulator import ROVSimulator
 from controllers.manual_controller import ManualController
+from controllers.mode_controller import ModeController
 
 
 class ROVGroundStation(QMainWindow):
@@ -38,6 +39,7 @@ class ROVGroundStation(QMainWindow):
 
         self.simulator = ROVSimulator()
         self.manual_controller = ManualController()
+        self.mode_controller = ModeController()
 
         self.simulation_time = 0.0
         self.last_update_time = time.monotonic()
@@ -210,6 +212,9 @@ class ROVGroundStation(QMainWindow):
             "Depth Hold",
             "Heading Hold"
         ])
+        self.mode_selector.currentTextChanged.connect(
+            self.on_mode_changed
+        )
 
         mode_layout.addWidget(mode_title)
         mode_layout.addWidget(self.mode_selector)
@@ -523,60 +528,67 @@ class ROVGroundStation(QMainWindow):
     def update_simulation(self):
 
         current_time = time.monotonic()
-
         dt = current_time - self.last_update_time
-
         self.last_update_time = current_time
 
-        # Limit large time steps
-        dt = min(dt, 0.1)
+        # Keep the simulation stable if the application pauses briefly.
+        dt = max(0.001, min(dt, 0.1))
 
-        # ---------------------------------
-        # Manual mode
-        # ---------------------------------
+        selected_mode = self.mode_selector.currentText()
 
-        if (
-            self.is_armed
-            and self.mode_selector.currentText() == "Manual"
-        ):
-
-            command = self.manual_controller.get_command()
-
-            self.simulator.set_command(command)
-
-        else:
-
+        # Safety gate: disarmed always means zero requested and actual thrust.
+        if not self.is_armed:
             self.manual_controller.clear()
             self.simulator.stop()
 
-        # ---------------------------------
-        # Advance simulation
-        # ---------------------------------
+        elif selected_mode == "Manual":
+            command = self.manual_controller.get_command()
+            self.simulator.set_command(command)
 
+        elif selected_mode == "Depth Hold":
+            self.manual_controller.clear()
+            self.mode_controller.set_target_depth(
+                self.depth_input.value()
+            )
+            command = self.mode_controller.get_command(
+                "Depth Hold",
+                self.simulator.get_state()
+            )
+            self.simulator.set_command(command)
+
+        elif selected_mode == "Heading Hold":
+            self.manual_controller.clear()
+            self.mode_controller.set_target_heading(
+                self.heading_input.value()
+            )
+            command = self.mode_controller.get_command(
+                "Heading Hold",
+                self.simulator.get_state()
+            )
+            self.simulator.set_command(command)
+
+        else:
+            # Unknown mode: fail safe.
+            self.manual_controller.clear()
+            self.simulator.stop()
+
+        # Advance simulation and retrieve current telemetry.
         state = self.simulator.update(dt)
-
         self.simulation_time += dt
 
-        # ---------------------------------
-        # Update telemetry
-        # ---------------------------------
-
+        # Update telemetry cards.
         self.telemetry_labels["ROLL"].setText(
             f"{state.roll:.1f} °"
         )
-
         self.telemetry_labels["PITCH"].setText(
             f"{state.pitch:.1f} °"
         )
-
         self.telemetry_labels["YAW"].setText(
             f"{state.yaw:.1f} °"
         )
-
         self.telemetry_labels["DEPTH"].setText(
             f"{state.depth:.2f} m"
         )
-
         self.telemetry_labels["BATTERY"].setText(
             f"{state.battery_voltage:.2f} V"
         )
@@ -587,14 +599,10 @@ class ROVGroundStation(QMainWindow):
             f"VELOCITY = {state.surge_velocity:.2f} m/s"
         )
 
-        # ---------------------------------
-        # Update graph
-        # ---------------------------------
-
+        # Update depth-versus-time graph.
         self.time_history.append(self.simulation_time)
         self.depth_history.append(state.depth)
 
-        # Keep the last 120 data points
         self.time_history = self.time_history[-120:]
         self.depth_history = self.depth_history[-120:]
 
@@ -602,6 +610,17 @@ class ROVGroundStation(QMainWindow):
             self.time_history,
             self.depth_history
         )
+
+    def on_mode_changed(self, mode):
+        """
+        Clear any held manual input when changing operating modes.
+        The simulation timer will apply the newly selected mode.
+        """
+        self.manual_controller.clear()
+
+        # Stop residual commanded thrust before the next mode computes
+        # its own command. This does not reset vehicle momentum.
+        self.simulator.stop()
 
     # =====================================
     # APPLICATION STYLING
