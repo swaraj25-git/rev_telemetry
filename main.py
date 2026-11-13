@@ -1,10 +1,11 @@
 
 import sys
 import time
+import math
 
 import pyqtgraph as pg
 
-from PySide6.QtCore import Qt, QTimer, QEvent
+from PySide6.QtCore import Qt, QTimer, QEvent, QUrl
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QAbstractSpinBox,
 )
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from simulation.rov_simulator import ROVSimulator
 from controllers.manual_controller import ManualController
@@ -369,19 +371,85 @@ class ROVGroundStation(QMainWindow):
         map_title = QLabel("UNDERWATER LOCATION MAP")
         map_title.setObjectName("sectionTitle")
 
-        map_placeholder = QLabel(
-            "OpenStreetMap integration\n\n"
-            "Will be added in the map integration stage."
+        self.map_view = QWebEngineView()
+        self.map_view.setMinimumHeight(300)
+
+        # Identify this desktop application to the OSM tile service.
+        # Add a real project contact URL/email when one is available.
+        self.map_view.page().profile().setHttpUserAgent(
+            "CrotiaROVGroundStation/1.0"
         )
 
-        map_placeholder.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
+        # Change these coordinates to the intended simulation location.
+        # X/Y simulator positions are treated as local east/north metres.
+        self.map_origin_lat = 18.5204
+        self.map_origin_lon = 73.8567
+
+        map_html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport"
+                  content="width=device-width, initial-scale=1.0">
+            <link rel="stylesheet"
+                  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
+            </script>
+            <style>
+                html, body, #map {
+                    height: 100%;
+                    width: 100%;
+                    margin: 0;
+                    padding: 0;
+                    background: #172235;
+                }
+            </style>
+        </head>
+        <body>
+            <div id="map"></div>
+            <script>
+                const map = L.map('map').setView(
+                    [__MAP_LAT__, __MAP_LON__],
+                    15
+                );
+
+                L.tileLayer(
+                    'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    {
+                        maxZoom: 19,
+                        attribution: '&copy; OpenStreetMap contributors'
+                    }
+                ).addTo(map);
+
+                const rovMarker = L.marker(
+                    [__MAP_LAT__, __MAP_LON__]
+                ).addTo(map);
+
+                rovMarker.bindPopup('Simulated ROV position');
+
+                function updateRovMarker(lat, lon) {
+                    rovMarker.setLatLng([lat, lon]);
+                }
+            </script>
+        </body>
+        </html>
+        """
+
+        # Insert the configured starting coordinates into the map HTML.
+        map_html = map_html.replace(
+            "__MAP_LAT__", str(self.map_origin_lat)
+        ).replace(
+            "__MAP_LON__", str(self.map_origin_lon)
         )
 
-        map_placeholder.setObjectName("mapPlaceholder")
+        self.map_view.setHtml(
+            map_html,
+            QUrl("https://unpkg.com/")
+        )
 
         map_layout.addWidget(map_title)
-        map_layout.addWidget(map_placeholder)
+        map_layout.addWidget(self.map_view)
 
         monitoring_layout.addWidget(graph_card, 3)
         monitoring_layout.addWidget(map_card, 2)
@@ -576,6 +644,9 @@ class ROVGroundStation(QMainWindow):
         state = self.simulator.update(dt)
         self.simulation_time += dt
 
+        # Update the map marker using the simulated local position.
+        self.update_map_position(state.x, state.y)
+
         # Update telemetry cards.
         self.telemetry_labels["ROLL"].setText(
             f"{state.roll:.1f} °"
@@ -610,6 +681,31 @@ class ROVGroundStation(QMainWindow):
             self.time_history,
             self.depth_history
         )
+
+    def update_map_position(self, x_metres, y_metres):
+        """
+        Convert local simulator metres to approximate map coordinates.
+        This marker is a visualization, not GPS or navigation data.
+        """
+        metres_per_degree_lat = 111320.0
+        latitude = self.map_origin_lat + (
+            y_metres / metres_per_degree_lat
+        )
+
+        longitude_scale = metres_per_degree_lat * max(
+            0.01,
+            abs(math.cos(math.radians(self.map_origin_lat)))
+        )
+        longitude = self.map_origin_lon + (
+            x_metres / longitude_scale
+        )
+
+        javascript = (
+            "if (typeof updateRovMarker === 'function') {"
+            f"updateRovMarker({latitude:.8f}, {longitude:.8f});"
+            "}"
+        )
+        self.map_view.page().runJavaScript(javascript)
 
     def on_mode_changed(self, mode):
         """
