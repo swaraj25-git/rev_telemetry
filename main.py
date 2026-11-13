@@ -1,6 +1,7 @@
 import sys
 import time
 import math
+import bisect
 
 import pyqtgraph as pg
 
@@ -50,8 +51,15 @@ class ROVGroundStation(QMainWindow):
         self.time_history = []
         self.depth_history = []
 
-        # How many seconds of history are visible on the depth graph
+        # How many seconds are visible while the graph follows live data
         self.plot_window_seconds = 30.0
+
+        # How much history is kept so you can scroll/zoom back in time
+        self.max_history_seconds = 600.0
+
+        # True  -> axes lock to the live data and follow the line
+        # False -> the user is free to pan/zoom; axes stay where they are
+        self.follow_live = True
 
         self.telemetry_labels = {}
 
@@ -400,7 +408,38 @@ class ROVGroundStation(QMainWindow):
             pen=pg.mkPen("#00BFFF", width=2)
         )
 
-        graph_layout.addWidget(graph_title)
+        # Hide pyqtgraph's built-in "A" auto-range button; the reset
+        # button below replaces it.
+        self.depth_plot.hideButtons()
+
+        # Any manual pan/zoom with the mouse releases the live-follow lock.
+        # (Range changes made from code do not trigger this signal.)
+        self.depth_plot.getViewBox().sigRangeChangedManually.connect(
+            self.on_plot_manually_changed
+        )
+
+        # Header row: title on the left, status + reset button on the right
+        graph_header = QHBoxLayout()
+
+        self.graph_status_label = QLabel("● LIVE")
+        self.graph_status_label.setStyleSheet(
+            "color: #86EFAC; font-size: 11px; font-weight: bold;"
+        )
+
+        self.reset_view_button = QPushButton("⟲ RESET VIEW")
+        self.reset_view_button.setObjectName("resetViewButton")
+        self.reset_view_button.setToolTip(
+            "Lock the axes and follow the live line"
+        )
+        self.reset_view_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.reset_view_button.clicked.connect(self.reset_graph_view)
+
+        graph_header.addWidget(graph_title)
+        graph_header.addStretch()
+        graph_header.addWidget(self.graph_status_label)
+        graph_header.addWidget(self.reset_view_button)
+
+        graph_layout.addLayout(graph_header)
         graph_layout.addWidget(self.depth_plot)
 
         # ---------------------------------
@@ -749,30 +788,71 @@ class ROVGroundStation(QMainWindow):
         self.time_history.append(self.simulation_time)
         self.depth_history.append(state.depth)
 
-        # Drop samples that have scrolled out of the visible window.
-        cutoff = self.simulation_time - self.plot_window_seconds
-        while self.time_history and self.time_history[0] < cutoff:
-            self.time_history.pop(0)
-            self.depth_history.pop(0)
+        # Keep a long history so the user can scroll / zoom back in time.
+        cutoff = self.simulation_time - self.max_history_seconds
+        if self.time_history[0] < cutoff:
+            first = bisect.bisect_left(self.time_history, cutoff)
+            self.time_history = self.time_history[first:]
+            self.depth_history = self.depth_history[first:]
 
         self.depth_curve.setData(
             self.time_history,
             self.depth_history
         )
 
-        # X axis: sliding time window that moves with the line.
-        t_end = max(self.simulation_time, self.plot_window_seconds)
-        self.depth_plot.setXRange(
-            t_end - self.plot_window_seconds,
-            t_end,
-            padding=0
-        )
+        # Axes are only forced while live-follow is on. When the user has
+        # panned or zoomed, the view stays exactly where they left it.
+        if self.follow_live:
 
-        # Y axis: always include 0 m and at least 15 m,
-        # expanding if the ROV goes deeper.
-        y_min = min(0.0, min(self.depth_history))
-        y_max = max(15.0, max(self.depth_history) * 1.1)
-        self.depth_plot.setYRange(y_min, y_max, padding=0)
+            # X axis: sliding time window that moves with the line.
+            t_end = max(self.simulation_time, self.plot_window_seconds)
+            t_start = t_end - self.plot_window_seconds
+            self.depth_plot.setXRange(t_start, t_end, padding=0)
+
+            # Y axis: fit the visible samples, always including 0 m and
+            # at least 15 m, expanding if the ROV goes deeper.
+            first_visible = bisect.bisect_left(self.time_history, t_start)
+            visible = self.depth_history[first_visible:]
+            y_min = min(0.0, min(visible))
+            y_max = max(15.0, max(visible) * 1.1)
+            self.depth_plot.setYRange(y_min, y_max, padding=0)
+
+    def set_follow_live(self, follow):
+        """Switch the depth graph between live-follow and free-look."""
+        self.follow_live = follow
+
+        if follow:
+            self.graph_status_label.setText("● LIVE")
+            self.graph_status_label.setStyleSheet(
+                "color: #86EFAC; font-size: 11px; font-weight: bold;"
+            )
+        else:
+            self.graph_status_label.setText("● FREE VIEW")
+            self.graph_status_label.setStyleSheet(
+                "color: #FCD34D; font-size: 11px; font-weight: bold;"
+            )
+
+    def on_plot_manually_changed(self, *args):
+        """User dragged or zoomed the graph: stop forcing the axes."""
+        if self.follow_live:
+            self.set_follow_live(False)
+
+    def reset_graph_view(self):
+        """Lock the axes again so the graph follows the live line."""
+        self.set_follow_live(True)
+
+        # Apply the live range immediately instead of waiting for the
+        # next simulation tick.
+        if self.time_history:
+            t_end = max(self.simulation_time, self.plot_window_seconds)
+            t_start = t_end - self.plot_window_seconds
+            self.depth_plot.setXRange(t_start, t_end, padding=0)
+
+            first_visible = bisect.bisect_left(self.time_history, t_start)
+            visible = self.depth_history[first_visible:]
+            y_min = min(0.0, min(visible))
+            y_max = max(15.0, max(visible) * 1.1)
+            self.depth_plot.setYRange(y_min, y_max, padding=0)
 
     def on_map_load_finished(self, success):
         """Report whether the embedded map page itself loaded."""
@@ -945,6 +1025,19 @@ class ROVGroundStation(QMainWindow):
 
             QPushButton#disarmButton:hover {
                 background-color: #991B1B;
+            }
+
+            QPushButton#resetViewButton {
+                background-color: #26364C;
+                color: #00BFFF;
+                border: 1px solid #40536D;
+                border-radius: 5px;
+                padding: 3px 10px;
+                font-size: 11px;
+            }
+
+            QPushButton#resetViewButton:hover {
+                background-color: #31455F;
             }
 
         """)
