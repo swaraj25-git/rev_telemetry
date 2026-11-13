@@ -1,4 +1,3 @@
-
 import sys
 import time
 import math
@@ -20,6 +19,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QLineEdit,
     QAbstractSpinBox,
+    QSizePolicy,
+    QScrollArea,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -49,6 +50,9 @@ class ROVGroundStation(QMainWindow):
         self.time_history = []
         self.depth_history = []
 
+        # How many seconds of history are visible on the depth graph
+        self.plot_window_seconds = 30.0
+
         self.telemetry_labels = {}
 
         # ---------------------------------
@@ -56,11 +60,28 @@ class ROVGroundStation(QMainWindow):
         # ---------------------------------
 
         self.setWindowTitle("ROV Telemetry Ground Station")
-        self.resize(1250, 850)
-        self.setMinimumSize(1000, 700)
 
+        # Small minimum so the window can always fit on a laptop screen.
+        self.setMinimumSize(900, 550)
+
+        # Size the window relative to the usable screen area
+        # (excludes the taskbar).
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(
+            min(1250, int(screen.width() * 0.95)),
+            min(750, int(screen.height() * 0.90)),
+        )
+
+        # The dashboard lives inside a scroll area, so if the window is
+        # ever smaller than the content, a scroll bar appears instead of
+        # content being cut off.
         central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(central_widget)
+        self.setCentralWidget(scroll)
 
         self.main_layout = QVBoxLayout(central_widget)
         self.main_layout.setContentsMargins(18, 18, 18, 18)
@@ -193,7 +214,8 @@ class ROVGroundStation(QMainWindow):
 
     def create_control_sections(self):
 
-        controls_layout = QGridLayout()
+        # All four control panels sit in ONE row to save vertical space.
+        controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
 
         # ---------------------------------
@@ -220,6 +242,7 @@ class ROVGroundStation(QMainWindow):
 
         mode_layout.addWidget(mode_title)
         mode_layout.addWidget(self.mode_selector)
+        mode_layout.addStretch()
 
         # ---------------------------------
         # Target settings
@@ -244,10 +267,27 @@ class ROVGroundStation(QMainWindow):
         self.heading_input.setValue(90)
 
         target_layout.addWidget(target_title)
-        target_layout.addWidget(QLabel("Target Depth"))
-        target_layout.addWidget(self.depth_input)
-        target_layout.addWidget(QLabel("Target Heading"))
-        target_layout.addWidget(self.heading_input)
+
+        # Keep labels and spin boxes on separate rows to prevent overlap
+        # when Windows scaling or a smaller window compresses the panel.
+        target_layout.setSpacing(10)
+
+        depth_row = QHBoxLayout()
+        depth_label = QLabel("Target Depth")
+        depth_label.setMinimumWidth(110)
+        self.depth_input.setFixedHeight(40)
+        depth_row.addWidget(depth_label)
+        depth_row.addWidget(self.depth_input, 1)
+
+        heading_row = QHBoxLayout()
+        heading_label = QLabel("Target Heading")
+        heading_label.setMinimumWidth(110)
+        self.heading_input.setFixedHeight(40)
+        heading_row.addWidget(heading_label)
+        heading_row.addWidget(self.heading_input, 1)
+
+        target_layout.addLayout(depth_row)
+        target_layout.addLayout(heading_row)
 
         # ---------------------------------
         # Safety controls
@@ -302,10 +342,10 @@ class ROVGroundStation(QMainWindow):
         movement_layout.addWidget(movement_title)
         movement_layout.addWidget(movement_note)
 
-        controls_layout.addWidget(mode_card, 0, 0)
-        controls_layout.addWidget(target_card, 0, 1)
-        controls_layout.addWidget(safety_card, 1, 0)
-        controls_layout.addWidget(movement_card, 1, 1)
+        controls_layout.addWidget(mode_card, 1)
+        controls_layout.addWidget(target_card, 2)
+        controls_layout.addWidget(safety_card, 1)
+        controls_layout.addWidget(movement_card, 2)
 
         self.main_layout.addLayout(controls_layout)
 
@@ -341,6 +381,10 @@ class ROVGroundStation(QMainWindow):
             "bottom", "Time", units="s"
         )
 
+        # Stop pyqtgraph from switching to "mm" / "ks" style prefixes.
+        self.depth_plot.getAxis("left").enableAutoSIPrefix(False)
+        self.depth_plot.getAxis("bottom").enableAutoSIPrefix(False)
+
         self.depth_plot.showGrid(
             x=True,
             y=True,
@@ -360,7 +404,7 @@ class ROVGroundStation(QMainWindow):
         graph_layout.addWidget(self.depth_plot)
 
         # ---------------------------------
-        # Map placeholder
+        # Map
         # ---------------------------------
 
         map_card = QFrame()
@@ -371,8 +415,17 @@ class ROVGroundStation(QMainWindow):
         map_title = QLabel("UNDERWATER LOCATION MAP")
         map_title.setObjectName("sectionTitle")
 
+        self.map_status_label = QLabel("Loading map resources...")
+        self.map_status_label.setObjectName("mapStatus")
+        self.map_status_label.setWordWrap(True)
+
         self.map_view = QWebEngineView()
-        self.map_view.setMinimumHeight(300)
+        self.map_view.setMinimumHeight(150)
+        self.map_view.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding
+        )
+        self.map_view.loadFinished.connect(self.on_map_load_finished)
 
         # Identify this desktop application to the OSM tile service.
         # Add a real project contact URL/email when one is available.
@@ -408,19 +461,36 @@ class ROVGroundStation(QMainWindow):
         </head>
         <body>
             <div id="map"></div>
+            <div id="map-message"
+                 style="position:absolute;bottom:8px;left:8px;z-index:1000;
+                        background:#ffffffdd;color:#26364c;padding:5px 8px;
+                        border-radius:4px;font:12px Arial;">
+                Loading OpenStreetMap tiles...
+            </div>
             <script>
                 const map = L.map('map').setView(
                     [__MAP_LAT__, __MAP_LON__],
                     15
                 );
 
-                L.tileLayer(
+                const osmTiles = L.tileLayer(
                     'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                     {
                         maxZoom: 19,
                         attribution: '&copy; OpenStreetMap contributors'
                     }
                 ).addTo(map);
+
+                let tileErrors = 0;
+                osmTiles.on('tileerror', function () {
+                    tileErrors += 1;
+                    const status = document.getElementById('map-message');
+                    if (status) {
+                        status.textContent =
+                            'Map tiles are unavailable or blocked by the tile provider. ' +
+                            'Check the network and tile usage policy.';
+                    }
+                });
 
                 const rovMarker = L.marker(
                     [__MAP_LAT__, __MAP_LON__]
@@ -449,12 +519,17 @@ class ROVGroundStation(QMainWindow):
         )
 
         map_layout.addWidget(map_title)
-        map_layout.addWidget(self.map_view)
+        map_layout.addWidget(self.map_status_label)
+        map_layout.addWidget(self.map_view, 1)
 
+        # Smaller minimums: the row now stretches to fill spare height.
+        graph_card.setMinimumHeight(220)
+        map_card.setMinimumHeight(220)
         monitoring_layout.addWidget(graph_card, 3)
         monitoring_layout.addWidget(map_card, 2)
 
-        self.main_layout.addLayout(monitoring_layout)
+        # Stretch factor 1 -> this row absorbs all remaining vertical space.
+        self.main_layout.addLayout(monitoring_layout, 1)
 
     # =====================================
     # ARM
@@ -674,13 +749,41 @@ class ROVGroundStation(QMainWindow):
         self.time_history.append(self.simulation_time)
         self.depth_history.append(state.depth)
 
-        self.time_history = self.time_history[-120:]
-        self.depth_history = self.depth_history[-120:]
+        # Drop samples that have scrolled out of the visible window.
+        cutoff = self.simulation_time - self.plot_window_seconds
+        while self.time_history and self.time_history[0] < cutoff:
+            self.time_history.pop(0)
+            self.depth_history.pop(0)
 
         self.depth_curve.setData(
             self.time_history,
             self.depth_history
         )
+
+        # X axis: sliding time window that moves with the line.
+        t_end = max(self.simulation_time, self.plot_window_seconds)
+        self.depth_plot.setXRange(
+            t_end - self.plot_window_seconds,
+            t_end,
+            padding=0
+        )
+
+        # Y axis: always include 0 m and at least 15 m,
+        # expanding if the ROV goes deeper.
+        y_min = min(0.0, min(self.depth_history))
+        y_max = max(15.0, max(self.depth_history) * 1.1)
+        self.depth_plot.setYRange(y_min, y_max, padding=0)
+
+    def on_map_load_finished(self, success):
+        """Report whether the embedded map page itself loaded."""
+        if success:
+            self.map_status_label.setText(
+                "Map page loaded. Map tiles require an internet connection."
+            )
+        else:
+            self.map_status_label.setText(
+                "Map page failed to load. Check internet access or CDN availability."
+            )
 
     def update_map_position(self, x_metres, y_metres):
         """
@@ -727,6 +830,15 @@ class ROVGroundStation(QMainWindow):
         self.setStyleSheet("""
 
             QMainWindow {
+                background-color: #101827;
+            }
+
+            QScrollArea {
+                background-color: #101827;
+                border: none;
+            }
+
+            QScrollArea > QWidget > QWidget {
                 background-color: #101827;
             }
 
@@ -794,6 +906,12 @@ class ROVGroundStation(QMainWindow):
             QLabel#mutedText,
             QLabel#mapPlaceholder {
                 color: #94A3B8;
+            }
+
+            QLabel#mapStatus {
+                color: #94A3B8;
+                font-size: 10px;
+                padding: 2px 4px;
             }
 
             QComboBox,
