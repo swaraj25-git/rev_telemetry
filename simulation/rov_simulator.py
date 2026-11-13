@@ -3,298 +3,305 @@ from dataclasses import dataclass
 import math
 
 
-# -----------------------------------------
-# 1. SIMULATION CONFIGURATION
-# -----------------------------------------
-
 @dataclass
 class SimulationConfig:
-    # Translational acceleration (m/s^2)
-    linear_acceleration: float = 1.5
+    """Configuration values for the ROV physics simulation."""
 
-    # Angular acceleration (degrees/s^2)
+    linear_acceleration: float = 1.5
     angular_acceleration: float = 60.0
 
-    # Water resistance coefficients
     linear_drag: float = 0.8
     angular_drag: float = 1.5
 
-    # Thruster response time (seconds)
     thruster_response_time: float = 0.3
 
-    # Battery configuration
     initial_battery_voltage: float = 16.8
     minimum_battery_voltage: float = 12.0
-
-    # Approximate battery discharge rate
     battery_drain_rate: float = 0.0005
 
+    # Maximum allowed simulation time step.
+    max_dt: float = 0.1
 
-# -----------------------------------------
-# 2. ROBOT COMMANDS
-# -----------------------------------------
 
 @dataclass
 class ROVCommand:
+    """
+    Normalized ROV control command.
 
-    # Translational commands: -1 to +1
+    Every axis must remain between -1.0 and +1.0.
+    """
+
     surge: float = 0.0
     sway: float = 0.0
     heave: float = 0.0
 
-    # Rotational commands: -1 to +1
     roll: float = 0.0
     pitch: float = 0.0
     yaw: float = 0.0
 
     def clamp(self):
+        """Keep all command axes within their permitted range."""
 
-        # Prevent commands outside valid range
         for axis in (
             "surge",
             "sway",
             "heave",
             "roll",
             "pitch",
-            "yaw"
+            "yaw",
         ):
             value = getattr(self, axis)
-            setattr(self, axis, max(-1.0, min(1.0, value)))
+            value = max(-1.0, min(1.0, float(value)))
+            setattr(self, axis, value)
+
+        return self
+
+    def is_zero(self):
+        """Return True if all command axes are zero."""
+
+        return all(
+            getattr(self, axis) == 0.0
+            for axis in (
+                "surge",
+                "sway",
+                "heave",
+                "roll",
+                "pitch",
+                "yaw",
+            )
+        )
 
 
-# -----------------------------------------
-# 3. ROBOT STATE
-# -----------------------------------------
+@dataclass
 
 @dataclass
 class ROVState:
+    """Current simulated ROV position, orientation and telemetry."""
 
-    # World position
     x: float = 0.0
     y: float = 0.0
     depth: float = 0.0
 
-    # Translational velocity
-    surge_velocity: float = 0.0
-    sway_velocity: float = 0.0
-    heave_velocity: float = 0.0
+    velocity_x: float = 0.0
+    velocity_y: float = 0.0
+    velocity_depth: float = 0.0
 
-    # Orientation in degrees
     roll: float = 0.0
     pitch: float = 0.0
     yaw: float = 0.0
 
-    # Angular velocities in degrees/second
     roll_rate: float = 0.0
     pitch_rate: float = 0.0
     yaw_rate: float = 0.0
 
-    # Battery voltage
     battery_voltage: float = 16.8
 
+    @property
+    def surge_velocity(self):
+        """Forward velocity in the ROV's body frame."""
+        yaw_rad = math.radians(self.yaw)
 
-# -----------------------------------------
-# 4. ROV SIMULATION ENGINE
-# -----------------------------------------
+        return (
+            self.velocity_x * math.cos(yaw_rad)
+            + self.velocity_y * math.sin(yaw_rad)
+        )
+
 
 class ROVSimulator:
+    """
+    Simulates basic underwater ROV movement and telemetry.
+
+    Coordinate conventions:
+        +X: Forward when yaw is zero
+        +Y: Sideways to the right when yaw is zero
+        +Depth: Downward
+        +Yaw: Clockwise heading change
+
+    The simulator uses:
+        - First-order thruster response
+        - Linear and angular acceleration
+        - Linear and angular drag
+        - Battery voltage drain
+    """
+
+    AXES = (
+        "surge",
+        "sway",
+        "heave",
+        "roll",
+        "pitch",
+        "yaw",
+    )
 
     def __init__(self, config=None):
-
         self.config = config or SimulationConfig()
+
+        self.command = ROVCommand()
+        self.actual_command = ROVCommand()
 
         self.state = ROVState(
             battery_voltage=self.config.initial_battery_voltage
         )
 
-        self.command = ROVCommand()
-
-        # Actual thruster outputs after response delay
-        self.actual_command = ROVCommand()
-
-    # -------------------------------------
-    # Set movement commands
-    # -------------------------------------
-
     def set_command(self, command):
+        """
+        Set the requested thruster command.
 
-        command.clamp()
-        self.command = command
+        The supplied command is copied so external modifications
+        cannot unexpectedly change the simulator's command.
+        """
+
+        if not isinstance(command, ROVCommand):
+            raise TypeError("command must be an ROVCommand")
+
+        self.command = ROVCommand(
+            surge=command.surge,
+            sway=command.sway,
+            heave=command.heave,
+            roll=command.roll,
+            pitch=command.pitch,
+            yaw=command.yaw,
+        ).clamp()
 
     def stop(self):
+        """
+        Immediately set requested and actual thruster commands to zero.
+
+        This is used when the vehicle is disarmed or a safety stop
+        is requested. Vehicle momentum may still decay through drag.
+        """
 
         self.command = ROVCommand()
-
-    # -------------------------------------
-    # Thruster response calculation
-    # -------------------------------------
+        self.actual_command = ROVCommand()
 
     def update_thrusters(self, dt):
+        """
+        Simulate the delayed response of the thrusters.
 
-        response_time = self.config.thruster_response_time
+        Uses a first-order response model:
+            output change = (target - output) * dt / response_time
+        """
 
-        if response_time <= 0:
-            factor = 1.0
-        else:
-            factor = min(1.0, dt / response_time)
+        response_time = max(
+            0.001,
+            self.config.thruster_response_time
+        )
 
-        for axis in (
-            "surge",
-            "sway",
-            "heave",
-            "roll",
-            "pitch",
-            "yaw"
-        ):
+        alpha = min(1.0, dt / response_time)
 
+        for axis in self.AXES:
             target = getattr(self.command, axis)
             actual = getattr(self.actual_command, axis)
 
-            updated = actual + (target - actual) * factor
+            updated = actual + (target - actual) * alpha
 
             setattr(self.actual_command, axis, updated)
 
-    # -------------------------------------
-    # Translational movement
-    # -------------------------------------
-
     def update_translation(self, dt):
+        """Update position and linear velocity."""
 
         state = self.state
-        config = self.config
         command = self.actual_command
 
-        # Calculate acceleration
-        surge_acceleration = (
-            config.linear_acceleration * command.surge
-            - config.linear_drag * state.surge_velocity
+        acceleration = self.config.linear_acceleration
+        drag = self.config.linear_drag
+
+        # Convert body-frame forward/sideways thrust to world-frame
+        # X/Y movement using the current heading.
+        yaw_rad = math.radians(state.yaw)
+
+        surge_world_x = (
+            command.surge * math.cos(yaw_rad)
+            - command.sway * math.sin(yaw_rad)
         )
 
-        sway_acceleration = (
-            config.linear_acceleration * command.sway
-            - config.linear_drag * state.sway_velocity
+        surge_world_y = (
+            command.surge * math.sin(yaw_rad)
+            + command.sway * math.cos(yaw_rad)
         )
 
-        heave_acceleration = (
-            config.linear_acceleration * command.heave
-            - config.linear_drag * state.heave_velocity
-        )
+        ax = surge_world_x * acceleration - state.velocity_x * drag
+        ay = surge_world_y * acceleration - state.velocity_y * drag
 
-        # Update body-frame velocities
-        state.surge_velocity += surge_acceleration * dt
-        state.sway_velocity += sway_acceleration * dt
-        state.heave_velocity += heave_acceleration * dt
+        az = command.heave * acceleration - state.velocity_depth * drag
 
-        # Convert body-frame velocity to world coordinates
-        yaw_radians = math.radians(state.yaw)
+        state.velocity_x += ax * dt
+        state.velocity_y += ay * dt
+        state.velocity_depth += az * dt
 
-        world_x_velocity = (
-            state.surge_velocity * math.cos(yaw_radians)
-            - state.sway_velocity * math.sin(yaw_radians)
-        )
+        state.x += state.velocity_x * dt
+        state.y += state.velocity_y * dt
+        state.depth += state.velocity_depth * dt
 
-        world_y_velocity = (
-            state.surge_velocity * math.sin(yaw_radians)
-            + state.sway_velocity * math.cos(yaw_radians)
-        )
-
-        # Update position
-        state.x += world_x_velocity * dt
-        state.y += world_y_velocity * dt
-
-        # Positive heave means downward movement
-        state.depth += state.heave_velocity * dt
-
-        # Prevent negative depth
-        if state.depth < 0:
+        # An underwater ROV cannot move above the water surface.
+        if state.depth < 0.0:
             state.depth = 0.0
-
-            if state.heave_velocity < 0:
-                state.heave_velocity = 0.0
-
-    # -------------------------------------
-    # Rotational movement
-    # -------------------------------------
+            state.velocity_depth = max(0.0, state.velocity_depth)
 
     def update_rotation(self, dt):
+        """Update roll, pitch and yaw angles."""
 
         state = self.state
-        config = self.config
         command = self.actual_command
 
-        # Calculate angular acceleration
-        roll_acceleration = (
-            config.angular_acceleration * command.roll
-            - config.angular_drag * state.roll_rate
-        )
+        acceleration = self.config.angular_acceleration
+        drag = self.config.angular_drag
 
-        pitch_acceleration = (
-            config.angular_acceleration * command.pitch
-            - config.angular_drag * state.pitch_rate
-        )
+        roll_acc = command.roll * acceleration - state.roll_rate * drag
+        pitch_acc = command.pitch * acceleration - state.pitch_rate * drag
+        yaw_acc = command.yaw * acceleration - state.yaw_rate * drag
 
-        yaw_acceleration = (
-            config.angular_acceleration * command.yaw
-            - config.angular_drag * state.yaw_rate
-        )
+        state.roll_rate += roll_acc * dt
+        state.pitch_rate += pitch_acc * dt
+        state.yaw_rate += yaw_acc * dt
 
-        # Update angular velocities
-        state.roll_rate += roll_acceleration * dt
-        state.pitch_rate += pitch_acceleration * dt
-        state.yaw_rate += yaw_acceleration * dt
+        state.roll += state.roll_rate * dt
+        state.pitch += state.pitch_rate * dt
+        state.yaw += state.yaw_rate * dt
 
-        # Update orientation
-        state.roll = (
-            state.roll + state.roll_rate * dt + 180
-        ) % 360 - 180
+        # Keep roll and pitch within -180 to +180 degrees.
+        state.roll = (state.roll + 180.0) % 360.0 - 180.0
+        state.pitch = (state.pitch + 180.0) % 360.0 - 180.0
 
-        state.pitch = (
-            state.pitch + state.pitch_rate * dt + 180
-        ) % 360 - 180
-
-        state.yaw = (
-            state.yaw + state.yaw_rate * dt
-        ) % 360
-
-    # -------------------------------------
-    # Battery simulation
-    # -------------------------------------
+        # Keep heading between 0 and 360 degrees.
+        state.yaw %= 360.0
 
     def update_battery(self, dt):
+        """Simulate gradual battery voltage reduction."""
 
-        config = self.config
-        state = self.state
-        command = self.actual_command
-
-        total_thrust = (
-            abs(command.surge)
-            + abs(command.sway)
-            + abs(command.heave)
-            + abs(command.roll)
-            + abs(command.pitch)
-            + abs(command.yaw)
+        total_effort = sum(
+            abs(getattr(self.actual_command, axis))
+            for axis in self.AXES
         )
 
-        state.battery_voltage -= (
-            total_thrust * config.battery_drain_rate * dt
+        drain = (
+            total_effort
+            * self.config.battery_drain_rate
+            * dt
         )
 
-        state.battery_voltage = max(
-            config.minimum_battery_voltage,
-            state.battery_voltage
+        self.state.battery_voltage = max(
+            self.config.minimum_battery_voltage,
+            self.state.battery_voltage - drain
         )
-
-    # -------------------------------------
-    # Main simulation update
-    # -------------------------------------
 
     def update(self, dt):
+        """
+        Advance the simulation by dt seconds.
 
-        if dt <= 0:
-            return
+        Invalid, zero or negative time steps are ignored.
+        Large time steps are capped to maintain numerical stability.
+        """
 
-        # Avoid unstable updates after long pauses
-        dt = min(dt, 0.1)
+        try:
+            dt = float(dt)
+        except (TypeError, ValueError):
+            return self.state
+
+        if not math.isfinite(dt) or dt <= 0.0:
+            return self.state
+
+        dt = min(dt, self.config.max_dt)
 
         self.update_thrusters(dt)
         self.update_translation(dt)
@@ -302,3 +309,11 @@ class ROVSimulator:
         self.update_battery(dt)
 
         return self.state
+
+    def get_state(self):
+        """Return the current simulated telemetry state."""
+        return self.state
+
+    def get_actual_command(self):
+        """Return the current simulated thruster output."""
+        return self.actual_command

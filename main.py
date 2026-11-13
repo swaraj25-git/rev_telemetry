@@ -1,9 +1,10 @@
 
 import sys
+import time
 
 import pyqtgraph as pg
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -16,7 +17,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QComboBox,
     QDoubleSpinBox,
+    QLineEdit,
+    QAbstractSpinBox,
 )
+
+from simulation.rov_simulator import ROVSimulator
+from controllers.manual_controller import ManualController
 
 
 class ROVGroundStation(QMainWindow):
@@ -24,14 +30,31 @@ class ROVGroundStation(QMainWindow):
     def __init__(self):
         super().__init__()
 
+        # ---------------------------------
+        # 1. INITIALIZE SIMULATION
+        # ---------------------------------
+
         self.is_armed = False
+
+        self.simulator = ROVSimulator()
+        self.manual_controller = ManualController()
+
+        self.simulation_time = 0.0
+        self.last_update_time = time.monotonic()
+
+        self.time_history = []
+        self.depth_history = []
+
         self.telemetry_labels = {}
+
+        # ---------------------------------
+        # 2. MAIN WINDOW
+        # ---------------------------------
 
         self.setWindowTitle("ROV Telemetry Ground Station")
         self.resize(1250, 850)
         self.setMinimumSize(1000, 700)
 
-        # Main application container
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
@@ -39,18 +62,44 @@ class ROVGroundStation(QMainWindow):
         self.main_layout.setContentsMargins(18, 18, 18, 18)
         self.main_layout.setSpacing(14)
 
-        # Build dashboard sections
+        # ---------------------------------
+        # 3. BUILD DASHBOARD
+        # ---------------------------------
+
         self.create_header()
         self.create_telemetry_section()
         self.create_control_sections()
         self.create_monitoring_section()
 
-        # Apply application theme
         self.apply_styles()
 
-    # -----------------------------------------
-    # 1. HEADER
-    # -----------------------------------------
+        # ---------------------------------
+        # 4. KEYBOARD EVENT FILTER
+        # ---------------------------------
+
+        # Listen for keyboard events throughout the application.
+        # This prevents keyboard controls from depending only on
+        # the main window having direct keyboard focus.
+
+        QApplication.instance().installEventFilter(self)
+
+        # ---------------------------------
+        # 5. SIMULATION TIMER
+        # ---------------------------------
+
+        self.simulation_timer = QTimer(self)
+        self.simulation_timer.timeout.connect(
+            self.update_simulation
+        )
+
+        # 50 milliseconds = approximately 20 updates per second
+        self.simulation_timer.start(50)
+
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    # =====================================
+    # HEADER
+    # =====================================
 
     def create_header(self):
 
@@ -59,7 +108,9 @@ class ROVGroundStation(QMainWindow):
         title = QLabel("ROV GROUND STATION")
         title.setObjectName("mainTitle")
 
-        subtitle = QLabel("UNDERWATER VEHICLE MONITORING")
+        subtitle = QLabel(
+            "UNDERWATER VEHICLE MONITORING SYSTEM"
+        )
         subtitle.setObjectName("subtitle")
 
         title_layout = QVBoxLayout()
@@ -79,9 +130,9 @@ class ROVGroundStation(QMainWindow):
 
         self.main_layout.addLayout(header)
 
-    # -----------------------------------------
-    # 2. TELEMETRY CARDS
-    # -----------------------------------------
+    # =====================================
+    # TELEMETRY
+    # =====================================
 
     def create_telemetry_section(self):
 
@@ -94,14 +145,14 @@ class ROVGroundStation(QMainWindow):
         telemetry_grid.setSpacing(12)
 
         telemetry_data = [
-            ("ROLL", "2.5", "°"),
-            ("PITCH", "-1.2", "°"),
-            ("YAW", "90.0", "°"),
-            ("DEPTH", "12.5", "m"),
-            ("BATTERY", "14.5", "V"),
+            ("ROLL", "0.0 °"),
+            ("PITCH", "0.0 °"),
+            ("YAW", "0.0 °"),
+            ("DEPTH", "0.00 m"),
+            ("BATTERY", "16.80 V"),
         ]
 
-        for index, (name, value, unit) in enumerate(telemetry_data):
+        for index, (name, value) in enumerate(telemetry_data):
 
             card = QFrame()
             card.setObjectName("telemetryCard")
@@ -111,7 +162,7 @@ class ROVGroundStation(QMainWindow):
             name_label = QLabel(name)
             name_label.setObjectName("telemetryName")
 
-            value_label = QLabel(value + " " + unit)
+            value_label = QLabel(value)
             value_label.setObjectName("telemetryValue")
 
             card_layout.addWidget(name_label)
@@ -123,16 +174,28 @@ class ROVGroundStation(QMainWindow):
 
         self.main_layout.addLayout(telemetry_grid)
 
-    # -----------------------------------------
-    # 3. CONTROL SECTIONS
-    # -----------------------------------------
+        # Additional position information
+
+        self.position_label = QLabel(
+            "POSITION: X = 0.00 m | Y = 0.00 m"
+        )
+        self.position_label.setObjectName("mutedText")
+
+        self.main_layout.addWidget(self.position_label)
+
+    # =====================================
+    # CONTROL PANELS
+    # =====================================
 
     def create_control_sections(self):
 
         controls_layout = QGridLayout()
         controls_layout.setSpacing(12)
 
-        # Operating mode card
+        # ---------------------------------
+        # Operating mode
+        # ---------------------------------
+
         mode_card = QFrame()
         mode_card.setObjectName("panel")
 
@@ -151,7 +214,10 @@ class ROVGroundStation(QMainWindow):
         mode_layout.addWidget(mode_title)
         mode_layout.addWidget(self.mode_selector)
 
-        # Target settings card
+        # ---------------------------------
+        # Target settings
+        # ---------------------------------
+
         target_card = QFrame()
         target_card.setObjectName("panel")
 
@@ -170,16 +236,16 @@ class ROVGroundStation(QMainWindow):
         self.heading_input.setSuffix(" °")
         self.heading_input.setValue(90)
 
-        depth_label = QLabel("Target Depth")
-        heading_label = QLabel("Target Heading")
-
         target_layout.addWidget(target_title)
-        target_layout.addWidget(depth_label)
+        target_layout.addWidget(QLabel("Target Depth"))
         target_layout.addWidget(self.depth_input)
-        target_layout.addWidget(heading_label)
+        target_layout.addWidget(QLabel("Target Heading"))
         target_layout.addWidget(self.heading_input)
 
-        # Arm / Disarm card
+        # ---------------------------------
+        # Safety controls
+        # ---------------------------------
+
         safety_card = QFrame()
         safety_card.setObjectName("panel")
 
@@ -201,21 +267,30 @@ class ROVGroundStation(QMainWindow):
         safety_layout.addWidget(self.arm_button)
         safety_layout.addWidget(self.disarm_button)
 
-        # Movement control preview
+        # ---------------------------------
+        # Keyboard instructions
+        # ---------------------------------
+
         movement_card = QFrame()
         movement_card.setObjectName("panel")
 
         movement_layout = QVBoxLayout(movement_card)
 
-        movement_title = QLabel("MOVEMENT CONTROLS")
+        movement_title = QLabel("KEYBOARD CONTROLS")
         movement_title.setObjectName("sectionTitle")
 
         movement_note = QLabel(
-            "Keyboard controls and thruster commands "
-            "will be implemented in the simulation stage."
+            "W / S  - Forward / Backward\n"
+            "A / D  - Left / Right\n"
+            "Q / E  - Up / Down\n"
+            "← / →  - Turn Left / Right\n"
+            "I / K  - Pitch\n"
+            "J / L  - Roll\n\n"
+            "Hold a key to move. Release to slow down."
         )
-        movement_note.setWordWrap(True)
+
         movement_note.setObjectName("mutedText")
+        movement_note.setWordWrap(True)
 
         movement_layout.addWidget(movement_title)
         movement_layout.addWidget(movement_note)
@@ -227,46 +302,60 @@ class ROVGroundStation(QMainWindow):
 
         self.main_layout.addLayout(controls_layout)
 
-    # -----------------------------------------
-    # 4. MONITORING SECTION
-    # -----------------------------------------
+    # =====================================
+    # MONITORING
+    # =====================================
 
     def create_monitoring_section(self):
 
         monitoring_layout = QHBoxLayout()
         monitoring_layout.setSpacing(12)
 
+        # ---------------------------------
         # Depth graph
+        # ---------------------------------
+
         graph_card = QFrame()
         graph_card.setObjectName("panel")
 
         graph_layout = QVBoxLayout(graph_card)
 
-        graph_title = QLabel("DEPTH VS TIME")
+        graph_title = QLabel("LIVE DEPTH VS TIME")
         graph_title.setObjectName("sectionTitle")
 
         self.depth_plot = pg.PlotWidget()
         self.depth_plot.setBackground("#172235")
-        self.depth_plot.setLabel("left", "Depth", units="m")
-        self.depth_plot.setLabel("bottom", "Time", units="s")
-        self.depth_plot.showGrid(x=True, y=True, alpha=0.3)
+
+        self.depth_plot.setLabel(
+            "left", "Depth", units="m"
+        )
+
+        self.depth_plot.setLabel(
+            "bottom", "Time", units="s"
+        )
+
+        self.depth_plot.showGrid(
+            x=True,
+            y=True,
+            alpha=0.3
+        )
+
+        # Positive depth is displayed downward
         self.depth_plot.invertY(True)
 
-        sample_times = [0, 2, 4, 6, 8, 10]
-        sample_depths = [0, 2, 4, 6, 9, 12.5]
-
-        self.depth_plot.plot(
-            sample_times,
-            sample_depths,
-            pen=pg.mkPen("#00BFFF", width=2),
-            symbol="o",
-            symbolSize=6
+        self.depth_curve = self.depth_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#00BFFF", width=2)
         )
 
         graph_layout.addWidget(graph_title)
         graph_layout.addWidget(self.depth_plot)
 
+        # ---------------------------------
         # Map placeholder
+        # ---------------------------------
+
         map_card = QFrame()
         map_card.setObjectName("panel")
 
@@ -279,7 +368,11 @@ class ROVGroundStation(QMainWindow):
             "OpenStreetMap integration\n\n"
             "Will be added in the map integration stage."
         )
-        map_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        map_placeholder.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
         map_placeholder.setObjectName("mapPlaceholder")
 
         map_layout.addWidget(map_title)
@@ -290,37 +383,229 @@ class ROVGroundStation(QMainWindow):
 
         self.main_layout.addLayout(monitoring_layout)
 
-    # -----------------------------------------
-    # 5. ARM / DISARM UI ACTIONS
-    # -----------------------------------------
+    # =====================================
+    # ARM
+    # =====================================
 
     def arm_vehicle(self):
 
         self.is_armed = True
+
+        self.manual_controller.clear()
 
         self.armed_label.setText("ARMED")
         self.armed_label.setObjectName("armedStatus")
 
         self.refresh_status_style()
 
+        self.setFocus()
+
+    # =====================================
+    # DISARM
+    # =====================================
+
     def disarm_vehicle(self):
 
         self.is_armed = False
+
+        self.manual_controller.clear()
+
+        # Immediately zero requested and actual thrust
+        self.simulator.stop()
 
         self.armed_label.setText("DISARMED")
         self.armed_label.setObjectName("disarmedStatus")
 
         self.refresh_status_style()
 
+        self.setFocus()
+
+    # =====================================
+    # REFRESH STATUS STYLE
+    # =====================================
+
     def refresh_status_style(self):
 
-        # Refresh the label after changing its style identifier
-        self.armed_label.style().unpolish(self.armed_label)
-        self.armed_label.style().polish(self.armed_label)
+        self.armed_label.style().unpolish(
+            self.armed_label
+        )
 
-    # -----------------------------------------
-    # 6. APPLICATION STYLING
-    # -----------------------------------------
+        self.armed_label.style().polish(
+            self.armed_label
+        )
+
+        self.armed_label.update()
+
+    # =====================================
+    # KEYBOARD EVENT FILTER
+    # =====================================
+
+    def eventFilter(self, watched, event):
+
+        event_type = event.type()
+
+        # Clear held keys when application loses focus
+        if event_type in (
+            QEvent.Type.ApplicationDeactivate,
+            QEvent.Type.WindowDeactivate
+        ):
+
+            self.manual_controller.clear()
+            self.simulator.stop()
+
+            return False
+
+        # Only accept keyboard controls while armed
+        if not self.is_armed:
+            return super().eventFilter(watched, event)
+
+        # Only Manual mode accepts keyboard commands
+        if self.mode_selector.currentText() != "Manual":
+            return super().eventFilter(watched, event)
+
+        # Do not hijack typing in target input fields
+        if isinstance(
+            watched,
+            (QLineEdit, QAbstractSpinBox, QComboBox)
+        ):
+            return super().eventFilter(watched, event)
+
+        key_map = {
+            Qt.Key.Key_W: "W",
+            Qt.Key.Key_S: "S",
+            Qt.Key.Key_A: "A",
+            Qt.Key.Key_D: "D",
+            Qt.Key.Key_Q: "Q",
+            Qt.Key.Key_E: "E",
+
+            Qt.Key.Key_Left: "LEFT",
+            Qt.Key.Key_Right: "RIGHT",
+
+            Qt.Key.Key_I: "I",
+            Qt.Key.Key_K: "K",
+            Qt.Key.Key_J: "J",
+            Qt.Key.Key_L: "L",
+        }
+
+        # Key pressed
+        if event_type == QEvent.Type.KeyPress:
+
+            key = key_map.get(event.key())
+
+            if key:
+
+                # Repeated key events refresh the input timeout
+                self.manual_controller.key_pressed(key)
+
+                return True
+
+        # Key released
+        elif event_type == QEvent.Type.KeyRelease:
+
+            key = key_map.get(event.key())
+
+            if key:
+
+                # Ignore auto-repeat release events
+                if event.isAutoRepeat():
+                    return True
+
+                self.manual_controller.key_released(key)
+
+                return True
+
+        return super().eventFilter(watched, event)
+
+    # =====================================
+    # SIMULATION UPDATE
+    # =====================================
+
+    def update_simulation(self):
+
+        current_time = time.monotonic()
+
+        dt = current_time - self.last_update_time
+
+        self.last_update_time = current_time
+
+        # Limit large time steps
+        dt = min(dt, 0.1)
+
+        # ---------------------------------
+        # Manual mode
+        # ---------------------------------
+
+        if (
+            self.is_armed
+            and self.mode_selector.currentText() == "Manual"
+        ):
+
+            command = self.manual_controller.get_command()
+
+            self.simulator.set_command(command)
+
+        else:
+
+            self.manual_controller.clear()
+            self.simulator.stop()
+
+        # ---------------------------------
+        # Advance simulation
+        # ---------------------------------
+
+        state = self.simulator.update(dt)
+
+        self.simulation_time += dt
+
+        # ---------------------------------
+        # Update telemetry
+        # ---------------------------------
+
+        self.telemetry_labels["ROLL"].setText(
+            f"{state.roll:.1f} °"
+        )
+
+        self.telemetry_labels["PITCH"].setText(
+            f"{state.pitch:.1f} °"
+        )
+
+        self.telemetry_labels["YAW"].setText(
+            f"{state.yaw:.1f} °"
+        )
+
+        self.telemetry_labels["DEPTH"].setText(
+            f"{state.depth:.2f} m"
+        )
+
+        self.telemetry_labels["BATTERY"].setText(
+            f"{state.battery_voltage:.2f} V"
+        )
+
+        self.position_label.setText(
+            f"POSITION: X = {state.x:.2f} m | "
+            f"Y = {state.y:.2f} m | "
+            f"VELOCITY = {state.surge_velocity:.2f} m/s"
+        )
+
+        # ---------------------------------
+        # Update graph
+        # ---------------------------------
+
+        self.time_history.append(self.simulation_time)
+        self.depth_history.append(state.depth)
+
+        # Keep the last 120 data points
+        self.time_history = self.time_history[-120:]
+        self.depth_history = self.depth_history[-120:]
+
+        self.depth_curve.setData(
+            self.time_history,
+            self.depth_history
+        )
+
+    # =====================================
+    # APPLICATION STYLING
+    # =====================================
 
     def apply_styles(self):
 
@@ -431,10 +716,28 @@ class ROVGroundStation(QMainWindow):
 
         """)
 
+    # =====================================
+    # CLOSE EVENT
+    # =====================================
 
-# -----------------------------------------
+    def closeEvent(self, event):
+
+        # Stop simulation and clear commands on exit
+        self.is_armed = False
+
+        self.manual_controller.clear()
+        self.simulator.stop()
+
+        self.simulation_timer.stop()
+
+        QApplication.instance().removeEventFilter(self)
+
+        event.accept()
+
+
+# =========================================
 # APPLICATION ENTRY POINT
-# -----------------------------------------
+# =========================================
 
 if __name__ == "__main__":
 
